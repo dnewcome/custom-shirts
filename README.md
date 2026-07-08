@@ -145,6 +145,12 @@ steps.
 - **Pinning on the collider surface → NaN.** A pinned vertex sitting exactly on
   the collider fights its own contact. Keep pins clear of colliders (the neck
   ring sits above the capped-off torso top).
+- **Body pokes through the cloth → firm contact + per-substep `collide`.** Soft
+  body contact (`soft_contact_ke` ~10) barely pushes the cloth off the collider,
+  so the mannequin shows through. Match `cloth_h1`: `soft_contact_ke = 5e3`,
+  frictionless, `iterations=10` — but then call `model.collide` **every substep**
+  (once-per-frame lets contacts go stale and the firm penalty overshoots into
+  buzz). It still CUDA-graph-captures, so speed is unchanged.
 - **It never settles → damp it and drop self-collision.** SolverStyle3D has no
   global damping and its default air-drag is 0, so cloth oscillates forever; add
   per-substep velocity damping (we scale `particle_qd`). And cloth

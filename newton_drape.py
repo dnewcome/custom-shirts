@@ -472,14 +472,18 @@ class Example:
         self.model.particle_flags = wp.array(flags)
         print(f"[neckband] pinned {len(pinned)} neck particles")
 
+        # Contact tuned to match the cloth_h1 demo (which drapes with no
+        # poke-through): a FIRM penalty (ke 5e3, not 10 — soft contact barely
+        # pushed the cloth off the arms) and frictionless so it slides to rest.
         self.model.soft_contact_radius = 0.2e-2
         self.model.soft_contact_margin = 0.35e-2
-        self.model.soft_contact_ke = 1.0e1    # stiffer penalty overshoots -> the cloth buzzes on the body
+        self.model.soft_contact_ke = 5.0e3
         self.model.soft_contact_kd = 1.0e-6
-        self.model.soft_contact_mu = 0.2      # high friction here caused stick-slip jitter
+        self.model.soft_contact_mu = 0.0
+        self.model.shape_material_mu.fill_(0.0)
         self.model.set_gravity((0.0, 0.0, -9.81))
 
-        self.solver = newton.solvers.SolverStyle3D(model=self.model, iterations=5)
+        self.solver = newton.solvers.SolverStyle3D(model=self.model, iterations=10)
         # Cloth self-collision makes the heavy draping folds buzz against each
         # other forever (they never rest). Off by default for a clean settle
         # (folds may overlap slightly); SELFCOLLIDE=1 re-enables it.
@@ -503,18 +507,25 @@ class Example:
         self.capture()
 
     def capture(self):
-        if wp.get_device().is_cuda:
-            with wp.ScopedCapture() as cap:
-                self.simulate()
-            self.graph = cap.graph
-        else:
-            self.graph = None
+        # Firm contact (ke=5e3) needs contacts recomputed EVERY substep or stale
+        # contacts overshoot -> buzz. Try to still CUDA-graph-capture the whole
+        # substep loop (incl. per-substep model.collide) for speed; fall back to
+        # ungraphed stepping if collide isn't capturable on this build.
+        self.graph = None
+        if wp.get_device().is_cuda and os.environ.get("NOGRAPH") != "1":
+            try:
+                with wp.ScopedCapture() as cap:
+                    self.simulate()
+                self.graph = cap.graph
+            except Exception as e:
+                print(f"[capture] graph disabled ({type(e).__name__}); stepping directly")
+                self.graph = None
 
     def simulate(self):
-        self.model.collide(self.state_0, self.contacts)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
+            self.model.collide(self.state_0, self.contacts)     # fresh contacts each substep
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
             wp.launch(_damp_velocity, dim=self.model.particle_count,
