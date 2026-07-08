@@ -25,23 +25,37 @@ def mat(name, rgb, rough=0.75):
     b.inputs["Roughness"].default_value = rough
     return m
 
-# ---- garment + body -------------------------------------------------------
-shirt = load_obj(os.path.join(NEW, "shirt.obj"))
-shirt.name = "shirt"
-# panels are separate components; make each one's normals point outward
-# (left panels were placed mirrored, so their winding is reversed)
-me = shirt.data
-bpy.context.view_layer.objects.active = shirt
-bpy.ops.object.mode_set(mode="EDIT")
-bpy.ops.mesh.select_all(action="SELECT")
-bpy.ops.mesh.normals_make_consistent(inside=False)
-bpy.ops.object.mode_set(mode="OBJECT")
-shirt.data.materials.append(mat("cloth", (0.34, 0.38, 0.22), 0.82))  # olive fatigue
-bpy.ops.object.shade_smooth()
+# ---- garment: one object per pattern piece, distinct colours so the drape
+#      SHOWS THE PATTERN (which parts are front / back / sleeve, where seams fall)
+PIECE_COLOR = {
+    "front":  (0.42, 0.50, 0.26),   # olive green
+    "back":   (0.20, 0.34, 0.52),   # blue
+    "sleeve": (0.85, 0.28, 0.02),   # vivid orange (unmistakably not skin)
+}
+for name, rgb in PIECE_COLOR.items():
+    path = os.path.join(NEW, f"shirt_{name}.obj")
+    if not os.path.exists(path):
+        continue
+    obj = load_obj(path)
+    obj.name = name
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.mesh.normals_make_consistent(inside=False)
+    bpy.ops.object.mode_set(mode="OBJECT")
+    obj.data.materials.append(mat(name, rgb, 0.82))
+    bpy.ops.object.shade_smooth()
+    print(f"[piece] {name}: obj='{obj.name}' polys={len(obj.data.polygons)} mats={[m.name for m in obj.data.materials]}")
 
-torso = load_obj(os.path.join(NEW, "torso.obj"))
-torso.name = "torso"
-torso.data.materials.append(mat("body", (0.62, 0.55, 0.50), 0.6))
+torso = load_obj(os.path.join(NEW, "body.obj"))
+torso.name = "body"
+# ghost the mannequin: a faint reference so the coloured PATTERN pieces are what
+# you actually see (the loose sleeves sag off the thin arms, so opaque arms hide them)
+bodymat = mat("body", (0.80, 0.80, 0.82), 0.5)
+bodymat.blend_method = "BLEND"
+bodymat.show_transparent_back = False
+bodymat.node_tree.nodes["Principled BSDF"].inputs["Alpha"].default_value = 0.22
+torso.data.materials.append(bodymat)
 bpy.ops.object.shade_smooth()
 
 # ---- camera / lights / world (same recipe as assemble.py) -----------------

@@ -81,13 +81,14 @@ parametric torso, stitches **exactly** the graph edges, holds the neckline to a
 neck-sized ring, and relaxes under gravity + collision. Requires an NVIDIA GPU
 (CUDA 12, driver 545+) and the `.venv` from `make setup`.
 
-> Status: produces a recognizable shirt **with sleeves** — front/back closed,
-> placket down the center, neckline held to the neck, cap sewn to the armhole,
-> underarm seam closed, sleeves draping over arm colliders. Refinements
-> outstanding: crumpling where the neck funnel meets the shoulder fold, billowy /
-> asymmetric sleeves, generous fit. **Cuffs and a collar band** are the next spec
+> Status: a settled shirt **with sleeves on a parametric body + arms** (sized
+> from your measurements). The render **colour-codes each pattern piece**
+> (front / back / sleeve) over a ghosted body, so the drape reads as the *pattern*
+> — the colour boundaries are the seams (side, armscye, neckline). Refinements
+> outstanding: crumpling where the neck funnel meets the shoulder fold, a slightly
+> generous fit, minor armhole gaps. **Cuffs and a collar band** are the next spec
 > additions (just a template + stitch rows). Tune live in `--viewer gl`:
-> `FRAMES`, `MAXAREA`, and the `NECK_R`/`ARM_LEN`/ease constants in
+> `FRAMES`, `MAXAREA`, `ARM_DROP` (arm pose), and the `NECK_R`/ease constants in
 > `newton_drape.py`.
 
 ### Adding a garment part
@@ -142,6 +143,13 @@ steps.
 - **Pinning on the collider surface → NaN.** A pinned vertex sitting exactly on
   the collider fights its own contact. Keep pins clear of colliders (the neck
   ring sits above the capped-off torso top).
+- **It never settles → damp it and drop self-collision.** SolverStyle3D has no
+  global damping and its default air-drag is 0, so cloth oscillates forever; add
+  per-substep velocity damping (we scale `particle_qd`). And cloth
+  *self*-collision (`solver.collision.stiff_vf/ee/ef`) makes heavy draping folds
+  buzz against each other endlessly — we turn it off by default for a clean rest
+  (folds may overlap slightly; `SELFCOLLIDE=1` re-enables it). Body/arm contact
+  stays on.
 
 `dist/workshirt-all.svg` is the whole pattern laid out (open in any browser).
 `dist/parts/<name>.svg` is one millimetre-accurate panel per file.

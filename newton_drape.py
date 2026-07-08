@@ -133,7 +133,41 @@ def _norm(v):
 SLEEVE_HW = 210.0   # sleeve bicep half-width, mm (|x| at y=0)
 SLEEVE_WW = 135.0   # sleeve wrist half-width, mm
 
-ARM_LEN = 0.60   # 3D arm length, m (shoulder-ish to wrist)
+ARM_LEN = M["shoulderToWrist"] * MM   # 3D sleeve loft length = arm length, so it reaches the wrist
+ARM_DROP = float(os.environ.get("ARM_DROP") or 0.9)   # arm-axis downward tilt (bigger = more A-pose)
+
+def arm_mesh(A0, D):
+    """Tapered arm collider from the shoulder down the arm axis: upper-arm radius
+    (from biceps) -> wrist radius, length shoulderToWrist. Outward normals."""
+    D = _norm(np.asarray(D, dtype=float))
+    U = _norm(np.cross(D, np.array([0.0, 0.0, 1.0]))); W = _norm(np.cross(D, U))
+    L = M["shoulderToWrist"] * MM
+    r0 = M["biceps"] / (2 * math.pi) * MM * 0.85   # keep the arm inside the sleeve (avoid poke-through)
+    r1 = M["wrist"] / (2 * math.pi) * MM * 0.95
+    start = A0 + D * 0.02                           # start just outside the armhole, not inside the shoulder
+    Nr, Nt = 12, 24
+    th = np.linspace(0, 2 * math.pi, Nt, endpoint=False)
+    ring = np.cos(th)[:, None] * U[None, :] + np.sin(th)[:, None] * W[None, :]
+    rings = []
+    for k in range(Nr):
+        t = k / (Nr - 1)
+        rings.append(start[None, :] + D * (t * L) + (r0 + (r1 - r0) * t) * ring)
+    V = np.vstack(rings); F = []
+    for k in range(Nr - 1):
+        b0, b1 = k * Nt, (k + 1) * Nt
+        for j in range(Nt):
+            j2 = (j + 1) % Nt
+            F += [[b0 + j, b0 + j2, b1 + j], [b0 + j2, b1 + j2, b1 + j]]
+    wc = len(V); V = np.vstack([V, (start + D * L)[None, :]])   # cap the wrist
+    bb = (Nr - 1) * Nt
+    for j in range(Nt): F.append([bb + j, bb + (j + 1) % Nt, wc])
+    F = np.asarray(F, dtype=int)
+    a, b, c = V[F[:, 0]], V[F[:, 1]], V[F[:, 2]]
+    nrm = np.cross(b - a, c - a); cen = (a + b + c) / 3.0
+    rad = (cen - start) - np.outer((cen - start) @ D, D)        # radial (perp to axis)
+    flip = (nrm * rad).sum(1) < 0
+    F[flip] = F[flip][:, ::-1]
+    return V.astype(np.float32), F
 
 def _halfwidth_fn(v2d, nbnd):
     """Half-width |x| of the sleeve as a function of row y (from the boundary)."""
@@ -164,7 +198,7 @@ def place_sleeve(T, side, inst, tmpl):
     _, _, Vt = np.linalg.svd(ring - A0, full_matrices=False)
     nrm = Vt[2]
     if np.dot(nrm, np.array([A0[0], A0[1], 0.0])) < 0: nrm = -nrm   # point outward
-    D = _norm(nrm + np.array([0, 0, -0.6]))                        # arm axis: out + down
+    D = _norm(nrm + np.array([0, 0, -ARM_DROP]))                   # arm axis: out + down
     U = _norm(np.cross(D, np.array([0.0, 0.0, 1.0])))
     W = _norm(np.cross(D, U))
     hw = _halfwidth_fn(v2d, nbnd)
@@ -200,6 +234,13 @@ def quat_z_to(d):
     ax = _norm(np.cross(z, d))
     return wp.quat_from_axis_angle(wp.vec3(*ax), math.acos(max(-1.0, min(1.0, c))))
 
+@wp.kernel
+def _damp_velocity(qd: wp.array(dtype=wp.vec3), k: float):
+    # bleed kinetic energy each substep (Style3D has no global damping / air drag,
+    # so without this the cloth oscillates forever instead of settling)
+    i = wp.tid()
+    qd[i] = qd[i] * k
+
 # ================================================================ Example
 class Example:
     def __init__(self, viewer, args):
@@ -209,6 +250,7 @@ class Example:
         self.frame_dt = 1.0 / 60.0
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
+        self.damp = float(os.environ.get("DAMP") or 0.92)   # per-substep velocity damping
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
         newton.solvers.SolverStyle3D.register_custom_attributes(builder)
@@ -221,13 +263,16 @@ class Example:
             tmpl[name] = dict(v2d=v2d, tris=tris, nbnd=nbnd, xmax=xmax, edges=t["edges"])
 
         # ---- place every instance into ONE un-merged vertex pool ----
-        inst = {}; V3 = []; PV = []; TRI = []; arms = []; voff = 0
+        TYPES = ["front", "back", "sleeve"]     # per-piece colour groups for the render
+        inst = {}; V3 = []; PV = []; TRI = []; TRITYPE = []; arms = []; voff = 0
         def register(name, spec, pos3d):
             nonlocal voff
             T = tmpl[spec["template"]]
             inst[name] = dict(off=voff, n=len(pos3d), tmpl=spec["template"], pos3d=pos3d)
             V3.append(pos3d.astype(float)); PV.append(T["v2d"].astype(float) * MM)
-            TRI.append(T["tris"] + voff); voff += len(pos3d)
+            TRI.append(T["tris"] + voff)
+            TRITYPE.append(np.full(len(T["tris"]), TYPES.index(spec["template"])))
+            voff += len(pos3d)
         for name, spec in G["instances"].items():           # body first
             if spec["template"] == "sleeve": continue
             T = tmpl[spec["template"]]
@@ -237,7 +282,8 @@ class Example:
             pos3d, A0, D = place_sleeve(tmpl["sleeve"], spec["side"], inst, tmpl)
             register(name, spec, pos3d); arms.append((A0, D))
         V3 = np.vstack(V3); PV = np.vstack(PV); TRI = np.vstack(TRI)
-        self.tmpl, self.inst = tmpl, inst
+        TRITYPE = np.concatenate(TRITYPE)
+        self.tmpl, self.inst, self.TYPES = tmpl, inst, TYPES
 
         def edge_globals(instance, edge):
             i = inst[instance]; return [i["off"] + k for k in tmpl[i["tmpl"]]["edges"][edge]]
@@ -284,8 +330,8 @@ class Example:
                 (indices3d[:, 1] != indices3d[:, 2]) &
                 (indices3d[:, 0] != indices3d[:, 2]))
         dropped = int((~keep).sum())
-        indices3d = indices3d[keep]; TRI = TRI[keep]
-        self.vmap = vmap
+        indices3d = indices3d[keep]; TRI = TRI[keep]; TRITYPE = TRITYPE[keep]
+        self.vmap = vmap; self.tri_type = TRITYPE
         print(f"[weld] {voff} panel verts -> {len(uniq)} particles "
               f"({voff - len(uniq)} welded, {dropped} collapsed tris dropped)")
 
@@ -300,18 +346,21 @@ class Example:
             tri_aniso_ke=wp.vec3(*FAB["tri_aniso_ke"]),
             edge_aniso_ke=wp.vec3(*FAB["edge_aniso_ke"]), label="shirt")
 
-        # torso + arm colliders
+        # body collider: parametric torso + a tapered arm mesh per sleeve (sized
+        # from measurements). Kept as separate shapes; combined for the render.
+        ident = wp.transform(p=wp.vec3(0, 0, 0), q=wp.quat_identity())
         tv, tf = torso_mesh()
-        builder.add_shape_mesh(body=builder.add_body(),
-                               xform=wp.transform(p=wp.vec3(0, 0, 0), q=wp.quat_identity()),
+        builder.add_shape_mesh(body=builder.add_body(), xform=ident,
                                mesh=Mesh(tv.tolist(), tf.reshape(-1).tolist()))
         for A0, D in arms:
-            center = A0 + D * 0.30
-            builder.add_shape_capsule(body=builder.add_body(),
-                                      xform=wp.transform(p=wp.vec3(*center), q=quat_z_to(D)),
-                                      radius=0.050, half_height=0.22)
+            av, af = arm_mesh(A0, D)
+            builder.add_shape_mesh(body=builder.add_body(), xform=ident,
+                                   mesh=Mesh(av.tolist(), af.reshape(-1).tolist()))
         self.model = builder.finalize()
         self.gfaces = indices3d
+        # render only the torso; arms stay collider-only so they don't hide the
+        # (loose) amber sleeves that drape over them
+        self.body = (tv, tf)
 
         # NECKBAND: pin the neckline edges (on the neck ring, above the collider)
         flags = self.model.particle_flags.numpy(); pinned = set()
@@ -324,13 +373,22 @@ class Example:
         print(f"[neckband] pinned {len(pinned)} neck particles")
 
         self.model.soft_contact_radius = 0.2e-2
-        self.model.soft_contact_margin = 0.5e-2
-        self.model.soft_contact_ke = 2.0e1
+        self.model.soft_contact_margin = 0.35e-2
+        self.model.soft_contact_ke = 1.0e1    # stiffer penalty overshoots -> the cloth buzzes on the body
         self.model.soft_contact_kd = 1.0e-6
-        self.model.soft_contact_mu = 0.5
+        self.model.soft_contact_mu = 0.2      # high friction here caused stick-slip jitter
         self.model.set_gravity((0.0, 0.0, -9.81))
 
         self.solver = newton.solvers.SolverStyle3D(model=self.model, iterations=5)
+        # Cloth self-collision makes the heavy draping folds buzz against each
+        # other forever (they never rest). Off by default for a clean settle
+        # (folds may overlap slightly); SELFCOLLIDE=1 re-enables it.
+        if os.environ.get("NOCOLLIDE") == "1":
+            self.solver.collision = None
+        elif os.environ.get("SELFCOLLIDE") != "1" and self.solver.collision is not None:
+            self.solver.collision.stiff_vf = 0.0
+            self.solver.collision.stiff_ee = 0.0
+            self.solver.collision.stiff_ef = 0.0
         self.state_0, self.state_1 = self.model.state(), self.model.state()
         self.control = self.model.control()
         self.contacts = self.model.contacts()
@@ -340,8 +398,8 @@ class Example:
         except Exception:
             pass
 
-        self.torso = (tv, tf)
-        print(f"[build] {builder.particle_count} particles, {len(self.gfaces)} garment tris")
+        print(f"[build] {builder.particle_count} particles, {len(self.gfaces)} garment tris, "
+              f"body {len(self.body[0])} v")
         self.capture()
 
     def capture(self):
@@ -359,6 +417,8 @@ class Example:
             self.viewer.apply_forces(self.state_0)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
+            wp.launch(_damp_velocity, dim=self.model.particle_count,
+                      inputs=[self.state_0.particle_qd, self.damp])
 
     def step(self):
         if self.graph: wp.capture_launch(self.graph)
@@ -375,14 +435,28 @@ class Example:
         q = self.state_0.particle_q.numpy()
         if np.isnan(q).any():
             print("[export] WARNING: NaN — skipping OBJ"); return
+        spd = np.linalg.norm(self.state_0.particle_qd.numpy(), axis=1) * 1000
+        p = np.percentile(spd, [50, 90, 99])
+        fast = spd > 200
+        col = fast & (q[:, 2] > 0.0)                    # collar/neck region
+        slv = fast & (np.abs(q[:, 0]) > 0.34)           # out on the sleeves
+        bod = fast & ~col & ~slv
+        print(f"[settle] speed mm/s: p50={p[0]:.1f} p90={p[1]:.1f} p99={p[2]:.1f} max={spd.max():.1f} "
+              f"(damp={self.damp})")
+        print(f"[settle] fast(>200): {fast.sum()}  collar={col.sum()} sleeve={slv.sum()} body={bod.sum()}")
         def w(path, verts, faces):
             with open(path, "w") as fh:
                 for p in verts: fh.write(f"v {p[0]:.5f} {p[1]:.5f} {p[2]:.5f}\n")
                 for f in faces: fh.write(f"f {f[0]+1} {f[1]+1} {f[2]+1}\n")
         w(os.path.join(DIST, "shirt.obj"), q, self.gfaces)
-        w(os.path.join(DIST, "torso.obj"), self.torso[0], self.torso[1])
+        w(os.path.join(DIST, "body.obj"), self.body[0], self.body[1])
+        # one OBJ per pattern piece (front/back/sleeve) so the render can colour
+        # them separately — this is what makes the drape SHOW THE PATTERN
+        for t, name in enumerate(self.TYPES):
+            faces = self.gfaces[self.tri_type == t]
+            w(os.path.join(DIST, f"shirt_{name}.obj"), q, faces)
         np.save(os.path.join(DIST, "shirt_q.npy"), q)
-        print(f"[export] dist/newton/shirt.obj ({len(q)} verts, {len(self.gfaces)} tris) + torso.obj")
+        print(f"[export] shirt.obj + per-piece {self.TYPES} + body.obj")
 
 
 if __name__ == "__main__":
