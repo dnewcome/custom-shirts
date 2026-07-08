@@ -124,7 +124,7 @@ def wrap(v2d, xmax, sx, fy):
     ratio = 1.0 - npull * (1.0 - NECK_R / A_P)
     Xb = Xb * ratio
     Y = Yb * (1.0 - fold) * ratio
-    z = -y * MM + fold * 0.030 + npull * (NECK_Z + y * MM)   # lift the funnel to NECK_Z
+    z = -y * MM + fold * 0.006 + npull * (NECK_Z + y * MM)   # minimal shoulder arch; funnel to NECK_Z
     return np.column_stack([sx * Xb, fy * Y, z]).astype(np.float32)
 
 def _norm(v):
