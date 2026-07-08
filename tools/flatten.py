@@ -17,9 +17,11 @@ harmonic init, cotangent-free areas).
   .venv/bin/python tools/flatten.py dist/newton/shirt_front.obj dist/flat/front.svg
 """
 import sys, os, math
+from collections import defaultdict
 import numpy as np
 import igl
-from scipy.sparse import coo_matrix, csc_matrix
+from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse.csgraph import dijkstra
 from scipy.sparse.linalg import factorized
 
 MM = 1000.0   # OBJ is in metres (Newton units) -> mm for the pattern
@@ -38,6 +40,90 @@ def split_components(V, F):
         used = np.unique(Fc)
         remap = -np.ones(len(V), int); remap[used] = np.arange(len(used))
         yield V[used], remap[Fc]
+
+
+def boundary_loops(F):
+    """Return boundary loops as lists of vertex indices (one per open boundary)."""
+    cnt = defaultdict(int)
+    for f in F:
+        for a, b in ((f[0], f[1]), (f[1], f[2]), (f[2], f[0])):
+            cnt[frozenset((int(a), int(b)))] += 1
+    adj = defaultdict(list)
+    for e, c in cnt.items():
+        if c == 1:
+            a, b = tuple(e); adj[a].append(b); adj[b].append(a)
+    seen, loops = set(), []
+    for s in list(adj):
+        if s in seen:
+            continue
+        comp, stack = [], [s]
+        while stack:
+            x = stack.pop()
+            if x in seen:
+                continue
+            seen.add(x); comp.append(x); stack += adj[x]
+        loops.append(comp)
+    return loops
+
+
+def _shortest_path(V, F, srcs, tgts):
+    """Shortest edge path (by length) from any src vertex to the nearest tgt."""
+    r, c, d = [], [], []
+    for f in F:
+        for a, b in ((f[0], f[1]), (f[1], f[2]), (f[2], f[0])):
+            w = np.linalg.norm(V[a] - V[b]); r += [a, b]; c += [b, a]; d += [w, w]
+    g = csr_matrix((d, (r, c)), shape=(len(V), len(V)))
+    dist, pred, _ = dijkstra(g, indices=list(srcs), return_predecessors=True, min_only=True)
+    t = min(tgts, key=lambda v: dist[v])
+    path = [int(t)]
+    while pred[path[-1]] >= 0:
+        path.append(int(pred[path[-1]]))
+    return path[::-1]
+
+
+def cut_open(V, F, path):
+    """Open a mesh along an edge path (duplicate path verts, split the fans).
+    Turns a tube (2 boundary loops) into a flattenable disk."""
+    cut = {frozenset((path[i], path[i + 1])) for i in range(len(path) - 1)}
+    v2f = defaultdict(list)
+    for fi, f in enumerate(F):
+        for v in f:
+            v2f[int(v)].append(fi)
+    newV = [np.asarray(v, float) for v in V]
+    relabel = {}                                  # (face, old_vert) -> new_vert
+    for v in set(path):
+        faces = v2f[v]
+        if len(faces) < 2:
+            continue
+        ew = defaultdict(list)                    # neighbour w -> faces sharing edge (v,w)
+        for fi in faces:
+            for w in F[fi]:
+                if int(w) != v:
+                    ew[int(w)].append(fi)
+        fadj = {fi: set() for fi in faces}
+        for w, fs in ew.items():
+            if frozenset((v, w)) in cut:
+                continue                          # cut edge separates the two fans
+            for i in range(len(fs)):
+                for j in range(i + 1, len(fs)):
+                    fadj[fs[i]].add(fs[j]); fadj[fs[j]].add(fs[i])
+        seen, fans = set(), []
+        for fi in faces:
+            if fi in seen:
+                continue
+            comp, stack = [], [fi]
+            while stack:
+                x = stack.pop()
+                if x in seen:
+                    continue
+                seen.add(x); comp.append(x); stack += list(fadj[x])
+            fans.append(comp)
+        for g in fans[1:]:                        # first fan keeps v; others get a copy
+            nv = len(newV); newV.append(np.asarray(V[v], float))
+            for fi in g:
+                relabel[(fi, v)] = nv
+    Fc = np.array([[relabel.get((fi, int(x)), int(x)) for x in f] for fi, f in enumerate(F)], int)
+    return np.array(newV), Fc
 
 
 def arap_flatten(V, F, iters=40):
@@ -148,6 +234,12 @@ def main():
     V, F, _, _ = igl.remove_unreferenced(V, F.astype(np.int32))
     panels = []
     for idx, (Vc, Fc) in enumerate(split_components(V, F)):
+        loops = sorted(boundary_loops(Fc), key=len, reverse=True)
+        if len(loops) >= 2:                         # a tube (sewn sleeve) -> cut it open
+            path = _shortest_path(Vc, Fc, loops[0], loops[1])   # between the 2 largest loops
+            Vc, Fc = cut_open(Vc, Fc, path)
+            extra = f" (+{len(loops)-2} small hole(s) ignored)" if len(loops) > 2 else ""
+            print(f"  panel{idx}: tube -> cut a {len(path)-1}-edge seam to open it{extra}")
         uv = arap_flatten(Vc, Fc)
         a3 = igl.doublearea(Vc, Fc.astype(np.int32)).sum()
         a2 = igl.doublearea(np.pad(uv, ((0, 0), (0, 1))), Fc.astype(np.int32)).sum()

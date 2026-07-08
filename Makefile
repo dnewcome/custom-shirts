@@ -74,6 +74,11 @@ flatten: ## Unfold a 3D panel mesh -> flat 2D pattern SVG (ARAP)  [FLAT_MESH=..]
 segment: ## Split a 3D garment mesh into panels by marked seams  [MESH_IN=.. OUT=..]
 	$(BLENDER) --background --python tools/segment.py -- $(MESH_IN) $(OUT)
 
+.PHONY: unfold
+unfold: ## Pepakura-style: cut a seam-marked mesh into panels, then flatten each  [MESH_IN=..]
+	$(BLENDER) --background --python tools/segment.py -- $(MESH_IN) $(OUT)
+	@for p in $(OUT)/panel_*.obj; do echo "-- $$p"; $(PY) tools/flatten.py $$p; done
+
 # ---------------------------------------------------------------- setup / misc
 .PHONY: setup
 setup: ## Create the .venv and install Newton + JS deps (one time)
