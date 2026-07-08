@@ -29,6 +29,57 @@ G = json.load(open(os.path.join(HERE, "dist", "garment.json")))
 M = G["measurements"]
 FAB = G["fabric"]
 
+def resample_polyline(P, N):
+    """Resample a polyline to N points evenly by arc length (endpoints kept)."""
+    P = np.asarray(P, float)
+    if N < 2 or len(P) < 2:
+        return np.repeat(P[:1], max(N, 1), axis=0)
+    seg = np.linalg.norm(np.diff(P, axis=0), axis=1)
+    s = np.concatenate([[0.0], np.cumsum(seg)]); L = s[-1]
+    if L < 1e-9:
+        return np.repeat(P[:1], N, axis=0)
+    t = np.linspace(0.0, L, N)
+    return np.column_stack([np.interp(t, s, P[:, 0]), np.interp(t, s, P[:, 1])])
+
+def resample_seams(G, spacing=10.0):
+    """Give every SEAM matching attachment points: resample the two edges of each
+    stitch to the same arc-length subdivision, then rebuild each panel's boundary
+    from its resampled edges. Independently-triangulated panels otherwise land
+    mismatched vertices on a shared seam -> puckers + a ragged weld. Paired edges
+    come out with equal vertex counts so the weld is a clean 1:1."""
+    T = G["templates"]; I = G["instances"]
+    def te(ie):                                            # [instance, edge] -> (template, edge)
+        return (I[ie[0]]["template"], ie[1])
+    def poly(tn, en):
+        o = T[tn]["outline"]; return np.array([o[i] for i in T[tn]["edges"][en]], float)
+    def arclen(P):
+        return float(np.linalg.norm(np.diff(P, axis=0), axis=1).sum()) if len(P) > 1 else 0.0
+    count = {}
+    for st in G["stitches"]:
+        a = te(st["a"]); b = st["b"]
+        bs = [te(x) for x in (b if isinstance(b[0], list) else [b])]
+        if len(bs) == 1:                                   # 1-1 seam: both sides equal N
+            n = max(2, round(max(arclen(poly(*a)), arclen(poly(*bs[0]))) / spacing))
+            count[a] = n; count[bs[0]] = n
+        else:                                              # armscye: cap <-> front+back armhole
+            cs = [max(2, round(arclen(poly(*be)) / spacing)) for be in bs]
+            for be, c in zip(bs, cs):
+                count[be] = c
+            count[a] = sum(cs) - (len(bs) - 1)             # shared corner(s) between b edges
+    for tn, t in T.items():                                # free edges keep their count
+        for en, idx in t["edges"].items():
+            count.setdefault((tn, en), len(idx))
+    for tn, t in T.items():                                # rebuild each boundary
+        order = sorted(t["edges"], key=lambda en: min(t["edges"][en]))
+        newo, newe = [], {}
+        for en in order:
+            R = resample_polyline(poly(tn, en), count[(tn, en)])
+            newe[en] = list(range(len(newo), len(newo) + len(R)))
+            newo.extend(R.tolist())
+        t["outline"] = newo; t["edges"] = newe
+
+resample_seams(G)
+
 # ---------------------------------------------------------------- meshing
 def triangulate(outline, maxarea):
     pts = np.asarray(outline, dtype=float)
@@ -245,14 +296,14 @@ def place_sleeve(T, side, inst, tmpl):
         ring_p = ring_at((phi + math.pi) / (2 * math.pi))   # around-arm -> armhole ring
         wrist_p = A0 + D * ARM_LEN + Rw * (math.cos(phi) * U + math.sin(phi) * W)
         pos[i] = (1.0 - lnorm) * ring_p + lnorm * wrist_p
-    # place the cap EDGE exactly on the armhole ring (by arc-length) so it is
-    # coincident with the shirt armhole -> clean sew + a solid anchor to pin
+    # place each cap vertex ON its matching armhole-ring node (1:1). After seam
+    # resampling the cap has exactly as many verts as the ring (front.armhole +
+    # back.armhole, sharing the shoulder corner), so cap[i] == ring_node[i] and
+    # the weld is coincident and clean. Order matches the weld's gB below.
+    ring_nodes = np.vstack([fpos, bpos[::-1][1:]])       # underarm->shoulder(front)->underarm(back)
     cap_order = edges["cap"]
-    cp = v2d[cap_order]
-    cc = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(cp, axis=0), axis=1))])
-    cc /= (cc[-1] or 1.0)
-    for m, vi in enumerate(cap_order):
-        pos[vi] = ring_at(1.0 - cc[m] if flip else cc[m])
+    for i in range(min(len(cap_order), len(ring_nodes))):
+        pos[cap_order[i]] = ring_nodes[i]
     return pos, A0, D
 
 def quat_z_to(d):
@@ -394,30 +445,24 @@ class Example:
             if ra != rb: parent[ra] = rb
         THRESH = {"armscye": 0.030}
         for st in G["stitches"]:
-            ga = edge_globals(*st["a"]); pa = edge_pos(*st["a"])
-            b = st["b"]; targets = b if isinstance(b[0], list) else [b]
-            gb, pbl = [], []
-            for be in targets:
-                gb += edge_globals(*be); pbl.append(edge_pos(*be))
-            gb = list(gb); pb = np.vstack(pbl); thr = THRESH.get(st.get("kind"), 0.015)
-            # weld the SMALLER edge to UNIQUE nearest targets on the larger edge.
-            # never reuse a target -> no two verts collapse into one -> no dropped
-            # triangles -> no holes at a many-to-few seam (the armscye).
-            if len(ga) <= len(gb):
-                sg, sp, tg, tp = ga, pa, gb, pb
+            ga = list(edge_globals(*st["a"])); pa = np.asarray(edge_pos(*st["a"]))
+            b = st["b"]; bs = b if isinstance(b[0], list) else [b]
+            if len(bs) == 1:
+                gb = list(edge_globals(*bs[0])); pb = np.asarray(edge_pos(*bs[0]))
             else:
-                sg, sp, tg, tp = gb, pb, ga, pa
-            used, hit = set(), 0
-            for m, s in enumerate(sg):
-                for j in np.argsort(np.linalg.norm(tp - sp[m], axis=1)):
-                    j = int(j)
-                    if j in used:
-                        continue
-                    if np.linalg.norm(tp[j] - sp[m]) >= thr:
-                        break
-                    union(s, tg[j]); used.add(j); hit += 1
-                    break
-            print(f"    {st.get('kind','?'):9s} {st['a'][0]}.{st['a'][1]:12s} -> {hit}/{len(sg)} welds")
+                # armscye: cap <-> front.armhole + reversed(back.armhole), sharing
+                # the shoulder corner (matches place_sleeve's ring order)
+                e0g, e0p = list(edge_globals(*bs[0])), edge_pos(*bs[0])
+                e1g, e1p = list(edge_globals(*bs[1])), edge_pos(*bs[1])
+                gb = e0g + e1g[::-1][1:]; pb = np.vstack([e0p, e1p[::-1][1:]])
+            hit = 0
+            if len(ga) == len(gb):                       # resampled -> equal counts -> clean 1:1
+                if np.linalg.norm(pa[0] - pb[0]) > np.linalg.norm(pa[0] - pb[-1]):
+                    gb = gb[::-1]; pb = pb[::-1]          # orientation
+                for i in range(len(ga)):
+                    if np.linalg.norm(pa[i] - pb[i]) < 0.05:
+                        union(ga[i], gb[i]); hit += 1
+            print(f"    {st.get('kind','?'):9s} {st['a'][0]}.{st['a'][1]:12s} -> {hit}/{len(ga)} welds (1:1)")
         for a, b in collar_welds:        # weld each collar band onto its neckline (1:1, coincident)
             union(a, b)
         print(f"    collar    (row0->neckline)      -> {len(collar_welds)} welds")
