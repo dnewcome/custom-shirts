@@ -1,0 +1,377 @@
+#!/usr/bin/env python
+"""
+Newton (Style3D) drape DERIVED from the canonical garment spec.
+
+Source of truth: dist/garment.json  (body + panel templates with NAMED EDGES +
+instances + an explicit STITCH GRAPH + a neckband constraint). This script is a
+pure deriver: it triangulates the templates, lays the instances out on a body,
+stitches EXACTLY the graph edges, holds the neckline to a neck-sized ring (the
+collar stand-in), and relaxes it. Nothing here defines the garment — edit
+export-garment.mjs / the FreeSewing params and regenerate.
+
+  .venv/bin/python newton_drape.py --viewer gl                 # interactive
+  .venv/bin/python newton_drape.py --viewer null --num-frames 150   # headless + OBJ
+"""
+import json, math, os
+import numpy as np
+import triangle as tr
+import warp as wp
+import newton
+import newton.examples
+from newton import Mesh, ParticleFlags
+from newton.solvers import style3d
+
+MM = 1.0e-3
+HERE = os.path.dirname(os.path.abspath(__file__))
+DIST = os.path.join(HERE, "dist", "newton")
+os.makedirs(DIST, exist_ok=True)
+G = json.load(open(os.path.join(HERE, "dist", "garment.json")))
+M = G["measurements"]
+FAB = G["fabric"]
+
+# ---------------------------------------------------------------- meshing
+def triangulate(outline, maxarea):
+    pts = np.asarray(outline, dtype=float)
+    n = len(pts)
+    segs = np.array([[i, (i + 1) % n] for i in range(n)], dtype=int)
+    t = tr.triangulate({"vertices": pts, "segments": segs}, f"pq30a{maxarea}")
+    v = np.asarray(t["vertices"], dtype=float)
+    f = np.asarray(t["triangles"], dtype=int)
+    assert len(v) >= n and np.allclose(v[:n], pts), "triangle reordered boundary verts"
+    a, b2, c = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+    area2 = (b2[:, 0]-a[:, 0])*(c[:, 1]-a[:, 1]) - (b2[:, 1]-a[:, 1])*(c[:, 0]-a[:, 0])
+    flip = area2 < 0
+    f[flip] = f[flip][:, ::-1]
+    return v, f, n
+
+# ---------------------------------------------------------------- body / torso
+def _ab(circ, wide, deep):
+    r = circ / (2 * math.pi); return r * wide * MM, r * deep * MM
+
+_sh = M["shoulderToShoulder"] / 2.0 * MM
+# collider is capped BELOW the neck ring so the pinned neckline never fights it
+STATIONS = [
+    (+0.020, _sh * 0.82, _sh * 0.42),     # shoulder ledge = top of collider
+    (-0.250, *_ab(M["chest"], 1.16, 0.82)),
+    (-0.470, *_ab(M["waist"], 1.14, 0.82)),
+    (-0.590, *_ab(M["hips"], 1.14, 0.84)),
+    (-0.870, *_ab(M["hips"], 1.12, 0.84)),
+]
+
+def torso_ab(z):
+    if z >= STATIONS[0][0]:  return STATIONS[0][1], STATIONS[0][2]
+    if z <= STATIONS[-1][0]: return STATIONS[-1][1], STATIONS[-1][2]
+    for k in range(len(STATIONS) - 1):
+        z0, a0, b0 = STATIONS[k]; z1, a1, b1 = STATIONS[k + 1]
+        if z1 <= z <= z0:
+            t = (z0 - z) / (z0 - z1)
+            return a0 + (a1 - a0) * t, b0 + (b1 - b0) * t
+    return STATIONS[-1][1], STATIONS[-1][2]
+
+def push_out(P, margin=1.07):
+    out = P.copy()
+    for i in range(len(out)):
+        x, y, z = out[i]
+        a, b = torso_ab(float(z))
+        r = math.sqrt((x / a) ** 2 + (y / b) ** 2)
+        if r < margin:
+            s = margin / max(r, 1e-6)
+            out[i, 0] = x * s; out[i, 1] = y * s
+    return out
+
+def torso_mesh():
+    Nt = 56
+    th = np.linspace(0, 2 * math.pi, Nt, endpoint=False)
+    rings = [np.column_stack([a*np.cos(th), b*np.sin(th), np.full(Nt, z)]) for (z, a, b) in STATIONS]
+    V = np.vstack(rings).astype(np.float32); F = []
+    for k in range(len(rings) - 1):
+        b0, b1 = k*Nt, (k+1)*Nt
+        for j in range(Nt):
+            j2 = (j+1) % Nt
+            F += [[b0+j, b0+j2, b1+j], [b0+j2, b1+j2, b1+j]]
+    top_c = len(V); V = np.vstack([V, [[0, 0, STATIONS[0][0]+0.03]]]).astype(np.float32)
+    for j in range(Nt): F.append([j, top_c, (j+1) % Nt])
+    bb = (len(rings)-1)*Nt
+    bot_c = len(V); V = np.vstack([V, [[0, 0, STATIONS[-1][0]-0.02]]]).astype(np.float32)
+    for j in range(Nt): F.append([bb+(j+1) % Nt, bot_c, bb+j])
+    F = np.asarray(F, dtype=int)
+    a, b, c = V[F[:, 0]], V[F[:, 1]], V[F[:, 2]]
+    nrm = np.cross(b-a, c-a); cen = (a+b+c)/3.0; rad = cen.copy(); rad[:, 2] = 0.0
+    flip = (nrm*rad).sum(1) < 0
+    F[flip] = F[flip][:, ::-1]
+    return V, F
+
+# ---------------------------------------------------------------- 3D placement
+A_P, B_P = _ab(M["chest"] + 90.0, 1.20, 0.80)      # garment wrap ellipse (chest + ease)
+NECK_R = G["neckband"]["circ"] / (2 * math.pi) * MM * 1.30   # neck opening radius
+NECK_Z = 0.085                                      # neck ring height (above collider)
+NECK_BLEND = 180.0                                  # mm; funnel height below the ring
+
+def smoothstep(e0, e1, x):
+    t = np.clip((x - e0) / (e1 - e0), 0.0, 1.0)
+    return t * t * (3 - 2 * t)
+
+def wrap(v2d, xmax, sx, fy):
+    """Flat panel (mm) -> 3D (m). Shoulder fold joins front/back at the top;
+    a neck-ring funnel shrinks the top-center opening to neck size + lifts it."""
+    x = np.abs(v2d[:, 0]); y = v2d[:, 1]
+    s = np.clip(x / xmax, 0.0, 1.0)
+    alpha = s * (math.pi / 2)
+    Xb = A_P * np.sin(alpha); Yb = B_P * np.cos(alpha)
+    fold = smoothstep(83.6 * 0.55, 83.6, x) * (1.0 - smoothstep(0.0, 250.0, y))
+    # neck-ring funnel: strong near the top-center, fades out by NECK_BLEND / s~0.42
+    npull = smoothstep(0.42, 0.20, s) * (1.0 - smoothstep(0.0, NECK_BLEND, y))
+    ratio = 1.0 - npull * (1.0 - NECK_R / A_P)
+    Xb = Xb * ratio
+    Y = Yb * (1.0 - fold) * ratio
+    z = -y * MM + fold * 0.030 + npull * (NECK_Z + y * MM)   # lift the funnel to NECK_Z
+    return np.column_stack([sx * Xb, fy * Y, z]).astype(np.float32)
+
+def _norm(v):
+    n = np.linalg.norm(v); return v / n if n > 1e-9 else v
+
+SLEEVE_HW = 210.0   # sleeve bicep half-width, mm (|x| at y=0)
+SLEEVE_WW = 135.0   # sleeve wrist half-width, mm
+
+ARM_LEN = 0.60   # 3D arm length, m (shoulder-ish to wrist)
+
+def _halfwidth_fn(v2d, nbnd):
+    """Half-width |x| of the sleeve as a function of row y (from the boundary)."""
+    bx = np.abs(v2d[:nbnd, 0]); by = v2d[:nbnd, 1]
+    def hw(y):
+        m = np.abs(by - y) < 22.0
+        return max(bx[m].max(), 15.0) if m.any() else 15.0
+    return hw
+
+def place_sleeve(T, side, inst, tmpl):
+    """Loft the flat sleeve onto the body as a generalized cylinder: every vert
+    blends from the armhole ring (front.armhole+back.armhole) at the cap end to a
+    wrist circle at the bottom, indexed by along-arm y and around-arm angle. The
+    cap lands on the armhole ring; the two underarm edges land coincident (seam
+    closes). Nothing is compressed to a point -> no strain explosion."""
+    v2d, edges, nbnd = T["v2d"], T["edges"], T["nbnd"]
+    fpos = inst[f"front{side}"]["pos3d"][tmpl["front"]["edges"]["armhole"]]   # underarm->shoulder
+    bpos = inst[f"back{side}"]["pos3d"][tmpl["back"]["edges"]["armhole"]]     # underarm->shoulder
+    ring = np.vstack([fpos, bpos[::-1]]).astype(float)                        # underarm..shoulder..underarm
+    seg = np.linalg.norm(np.diff(ring, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)]); cum /= (cum[-1] or 1.0)
+    def ring_at(t):
+        t = min(max(t, 0.0), 1.0)
+        i = max(1, min(int(np.searchsorted(cum, t)), len(ring) - 1))
+        f = (t - cum[i - 1]) / max(cum[i] - cum[i - 1], 1e-9)
+        return ring[i - 1] * (1 - f) + ring[i] * f
+    A0 = ring.mean(0)
+    _, _, Vt = np.linalg.svd(ring - A0, full_matrices=False)
+    nrm = Vt[2]
+    if np.dot(nrm, np.array([A0[0], A0[1], 0.0])) < 0: nrm = -nrm   # point outward
+    D = _norm(nrm + np.array([0, 0, -0.6]))                        # arm axis: out + down
+    U = _norm(np.cross(D, np.array([0.0, 0.0, 1.0])))
+    W = _norm(np.cross(D, U))
+    hw = _halfwidth_fn(v2d, nbnd)
+    xs, ys = v2d[:, 0], v2d[:, 1]
+    ytop, ywrist = ys.min(), ys.max(); span = max(ywrist - ytop, 1.0)
+    Rw = SLEEVE_WW / math.pi * MM
+    flip = (side == "L")
+    pos = np.zeros((len(v2d), 3), dtype=np.float32)
+    for i in range(len(v2d)):
+        phi = math.pi * xs[i] / max(hw(ys[i]), 1e-3)
+        phi = max(-math.pi, min(math.pi, phi))
+        if flip: phi = -phi
+        lnorm = (ys[i] - ytop) / span                       # 0 at cap top, 1 at wrist
+        ring_p = ring_at((phi + math.pi) / (2 * math.pi))   # around-arm -> armhole ring
+        wrist_p = A0 + D * ARM_LEN + Rw * (math.cos(phi) * U + math.sin(phi) * W)
+        pos[i] = (1.0 - lnorm) * ring_p + lnorm * wrist_p
+    # place the cap EDGE exactly on the armhole ring (by arc-length) so it is
+    # coincident with the shirt armhole -> clean sew + a solid anchor to pin
+    cap_order = edges["cap"]
+    cp = v2d[cap_order]
+    cc = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(cp, axis=0), axis=1))])
+    cc /= (cc[-1] or 1.0)
+    for m, vi in enumerate(cap_order):
+        pos[vi] = ring_at(1.0 - cc[m] if flip else cc[m])
+    return pos, A0, D
+
+def quat_z_to(d):
+    """Quaternion rotating local +Z onto direction d."""
+    d = _norm(np.asarray(d, dtype=float)); z = np.array([0, 0, 1.0])
+    c = float(np.dot(z, d))
+    if c > 0.9999: return wp.quat_identity()
+    if c < -0.9999: return wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), math.pi)
+    ax = _norm(np.cross(z, d))
+    return wp.quat_from_axis_angle(wp.vec3(*ax), math.acos(max(-1.0, min(1.0, c))))
+
+# ================================================================ Example
+class Example:
+    def __init__(self, viewer, args):
+        self.viewer = viewer
+        maxarea = getattr(args, "maxarea", 110.0)
+        self.sim_substeps = 10
+        self.frame_dt = 1.0 / 60.0
+        self.sim_dt = self.frame_dt / self.sim_substeps
+        self.sim_time = 0.0
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        newton.solvers.SolverStyle3D.register_custom_attributes(builder)
+
+        # templates: triangulate once
+        tmpl = {}
+        for name, t in G["templates"].items():
+            v2d, tris, nbnd = triangulate(t["outline"], maxarea)
+            xmax = float(np.asarray(t["outline"])[:, 0].max())
+            tmpl[name] = dict(v2d=v2d, tris=tris, nbnd=nbnd, xmax=xmax, edges=t["edges"])
+
+        # instances: place + add cloth
+        inst = {}
+        def add_instance(name, spec, pos3d):
+            T = tmpl[spec["template"]]; off = builder.particle_count
+            style3d.add_cloth_mesh(
+                builder, pos=wp.vec3(0, 0, 0), rot=wp.quat_identity(), vel=wp.vec3(0, 0, 0),
+                vertices=[wp.vec3(*p) for p in pos3d],
+                indices=T["tris"].reshape(-1).tolist(),
+                panel_verts=[wp.vec2(*(p * MM)) for p in T["v2d"]],
+                panel_indices=T["tris"].reshape(-1).tolist(),
+                density=FAB["density"], scale=1.0, particle_radius=5.0e-3,
+                tri_aniso_ke=wp.vec3(*FAB["tri_aniso_ke"]),
+                edge_aniso_ke=wp.vec3(*FAB["edge_aniso_ke"]), label=name)
+            inst[name] = dict(off=off, pos3d=pos3d, tmpl=spec["template"])
+        # pass 1: body panels (wrap); pass 2: sleeves (need the armhole ring placed)
+        for name, spec in G["instances"].items():
+            if spec["template"] == "sleeve": continue
+            T = tmpl[spec["template"]]
+            add_instance(name, spec, push_out(wrap(T["v2d"], T["xmax"], spec["sx"], spec["fy"])))
+        arms = []
+        for name, spec in G["instances"].items():
+            if spec["template"] != "sleeve": continue
+            pos3d, A0, D = place_sleeve(tmpl["sleeve"], spec["side"], inst, tmpl)
+            add_instance(name, spec, pos3d)
+            arms.append((A0, D))
+        self.tmpl, self.inst = tmpl, inst
+
+        def edge_globals(instance, edge):
+            i = inst[instance]; return [i["off"] + k for k in tmpl[i["tmpl"]]["edges"][edge]]
+        def edge_pos(instance, edge):
+            i = inst[instance]; return i["pos3d"][tmpl[i["tmpl"]]["edges"][edge]]
+
+        # STITCH GRAPH: pair each declared edge (coincident) and spring it.
+        # `b` may be a single [inst,edge] or a list of them (e.g. cap <-> f+b armhole).
+        KE = 2.0e2
+        KD = 0.5                       # damping — undamped seams let hanging sleeves resonate off
+        THRESH = {"armscye": 0.060}    # cap lands near the ring nodes; attach generously
+        nsp = 0
+        for st in G["stitches"]:
+            ga = edge_globals(*st["a"]); pa = edge_pos(*st["a"])
+            b = st["b"]
+            targets = b if isinstance(b[0], list) else [b]
+            gb, pbl = [], []
+            for be in targets:
+                gb += edge_globals(*be); pbl.append(edge_pos(*be))
+            pb = np.vstack(pbl)
+            thr = THRESH.get(st.get("kind"), 0.015)
+            hit = 0
+            for m, a in enumerate(ga):
+                d = np.linalg.norm(pb - pa[m], axis=1); j = int(np.argmin(d))
+                if d[j] < thr:
+                    builder.add_spring(a, gb[j], KE, KD, control=0.0); nsp += 1; hit += 1
+            print(f"    {st.get('kind','?'):9s} {st['a'][0]}.{st['a'][1]:12s} -> {hit}/{len(ga)} springs")
+        print(f"[stitch] {nsp} springs over {len(G['stitches'])} graph seams (ke={KE:g})")
+
+        # torso collider
+        tv, tf = torso_mesh()
+        builder.add_shape_mesh(body=builder.add_body(),
+                               xform=wp.transform(p=wp.vec3(0, 0, 0), q=wp.quat_identity()),
+                               mesh=Mesh(tv.tolist(), tf.reshape(-1).tolist()))
+        # arm colliders: a capsule down each sleeve's axis so it drapes over an arm
+        for A0, D in arms:
+            center = A0 + D * 0.30
+            builder.add_shape_capsule(body=builder.add_body(),
+                                      xform=wp.transform(p=wp.vec3(*center), q=quat_z_to(D)),
+                                      radius=0.050, half_height=0.22)
+        self.model = builder.finalize()
+
+        # NECKBAND: pin the neckline edges (placed on the neck ring, above the
+        # collider) — the collar stand-in that stops the front from caping.
+        flags = self.model.particle_flags.numpy(); pinned = 0
+        for instance, edge in G["neckband"]["edges"]:
+            for gi in edge_globals(instance, edge):
+                flags[gi] = flags[gi] & ~int(ParticleFlags.ACTIVE); pinned += 1
+        # pin the sleeve caps to the armhole ring (the armscye seam) — a stable
+        # anchor; the armscye springs then keep the shirt's armhole edge aligned.
+        for name, spec in G["instances"].items():
+            if spec["template"] == "sleeve":
+                for gi in edge_globals(name, "cap"):
+                    flags[gi] = flags[gi] & ~int(ParticleFlags.ACTIVE); pinned += 1
+        self.model.particle_flags = wp.array(flags)
+        print(f"[neckband] pinned {pinned} neckline particles to the neck ring")
+
+        self.model.soft_contact_radius = 0.2e-2
+        self.model.soft_contact_margin = 0.5e-2
+        self.model.soft_contact_ke = 2.0e1
+        self.model.soft_contact_kd = 1.0e-6
+        self.model.soft_contact_mu = 0.5
+        self.model.set_gravity((0.0, 0.0, -9.81))
+
+        self.solver = newton.solvers.SolverStyle3D(model=self.model, iterations=5)
+        self.state_0, self.state_1 = self.model.state(), self.model.state()
+        self.control = self.model.control()
+        self.contacts = self.model.contacts()
+        self.viewer.set_model(self.model)
+        try:
+            self.viewer.set_camera(wp.vec3(0.0, -1.6, -0.05), 0.0, -270.0)
+        except Exception:
+            pass
+
+        gfaces = [tmpl[inst[n]["tmpl"]]["tris"] + inst[n]["off"] for n in inst]
+        self.gfaces = np.vstack(gfaces)
+        self.torso = (tv, tf)
+        print(f"[build] {builder.particle_count} particles, {len(self.gfaces)} garment tris")
+        self.capture()
+
+    def capture(self):
+        if wp.get_device().is_cuda:
+            with wp.ScopedCapture() as cap:
+                self.simulate()
+            self.graph = cap.graph
+        else:
+            self.graph = None
+
+    def simulate(self):
+        self.model.collide(self.state_0, self.contacts)
+        for _ in range(self.sim_substeps):
+            self.state_0.clear_forces()
+            self.viewer.apply_forces(self.state_0)
+            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            self.state_0, self.state_1 = self.state_1, self.state_0
+
+    def step(self):
+        if self.graph: wp.capture_launch(self.graph)
+        else: self.simulate()
+        self.sim_time += self.frame_dt
+
+    def render(self):
+        self.viewer.begin_frame(self.sim_time)
+        self.viewer.log_state(self.state_0)
+        self.viewer.log_contacts(self.contacts, self.state_0)
+        self.viewer.end_frame()
+
+    def export_obj(self):
+        q = self.state_0.particle_q.numpy()
+        if np.isnan(q).any():
+            print("[export] WARNING: NaN — skipping OBJ"); return
+        def w(path, verts, faces):
+            with open(path, "w") as fh:
+                for p in verts: fh.write(f"v {p[0]:.5f} {p[1]:.5f} {p[2]:.5f}\n")
+                for f in faces: fh.write(f"f {f[0]+1} {f[1]+1} {f[2]+1}\n")
+        w(os.path.join(DIST, "shirt.obj"), q, self.gfaces)
+        w(os.path.join(DIST, "torso.obj"), self.torso[0], self.torso[1])
+        np.save(os.path.join(DIST, "shirt_q.npy"), q)
+        print(f"[export] dist/newton/shirt.obj ({len(q)} verts, {len(self.gfaces)} tris) + torso.obj")
+
+
+if __name__ == "__main__":
+    parser = newton.examples.create_parser()
+    parser.add_argument("--maxarea", type=float, default=110.0,
+                        help="triangle max area (mm^2); smaller = denser cloth")
+    viewer, args = newton.examples.init(parser)
+    example = Example(viewer, args)
+    newton.examples.run(example, args)
+    example.export_obj()

@@ -1,0 +1,24 @@
+{
+  "name": "custom-shirts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Parametric work/casual button-up: Banana Republic slim fit + army-fatigue detailing (square patch pockets, barrel cuffs), authored in code (FreeSewing v4) and exported to SVG for a 3D drape pass in Blender.",
+  "scripts": {
+    "render": "node render.mjs",
+    "nest": "node nest.mjs",
+    "panels": "node export-panels.mjs",
+    "assemble": "node export-panels.mjs && /opt/blender-5.0.1-linux-x64/blender --background --python assemble.py",
+    "drape": "node export-panels.mjs && /opt/blender-5.0.1-linux-x64/blender --background --python drape.py"
+  },
+  "dependencies": {
+    "@freesewing/brian": "4.9.0",
+    "@freesewing/config": "^4.9.0",
+    "@freesewing/core": "4.9.0",
+    "@freesewing/plugin-annotations": "4.9.0",
+    "@freesewing/plugin-bust": "4.9.0",
+    "@freesewing/plugin-flip": "4.9.0",
+    "@freesewing/plugin-transform": "^4.9.0",
+    "@freesewing/simon": "4.9.0"
+  }
+}
