@@ -61,11 +61,24 @@ drape-usd: garment ## Headless drape -> dist/newton/shirt_drape.usd (usdview/Ble
 assemble: panels ## Static geometric 3D assembly (no physics) -> dist/assembly.png
 	$(BLENDER) --background --python assemble.py
 
+# ------------------------------------------------ reverse: 3D garment -> 2D pattern
+FLAT_MESH ?= dist/newton/shirt_front.obj   # a 3D panel mesh to unfold
+MESH_IN   ?= dist/newton/shirt.obj         # a full garment mesh to segment
+OUT       ?= dist/panels3d
+
+.PHONY: flatten
+flatten: ## Unfold a 3D panel mesh -> flat 2D pattern SVG (ARAP)  [FLAT_MESH=..]
+	$(PY) tools/flatten.py $(FLAT_MESH)
+
+.PHONY: segment
+segment: ## Split a 3D garment mesh into panels by marked seams  [MESH_IN=.. OUT=..]
+	$(BLENDER) --background --python tools/segment.py -- $(MESH_IN) $(OUT)
+
 # ---------------------------------------------------------------- setup / misc
 .PHONY: setup
 setup: ## Create the .venv and install Newton + JS deps (one time)
 	uv venv .venv --python 3.12
-	uv pip install --python .venv/bin/python "newton[examples]" triangle
+	uv pip install --python .venv/bin/python "newton[examples]" triangle libigl scipy cairosvg
 	npm install
 
 .PHONY: clean

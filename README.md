@@ -46,7 +46,9 @@ make drape          # headless drape -> OBJ -> Blender still (dist/newton/drape*
 make render         # flat pattern -> dist/workshirt-all.svg + dist/parts/*.svg
 make nest           # ShopBot cut layout -> dist/cut-layout.svg  (BED_W=1400 SA=10)
 make assemble       # static 3D assembly (no physics) -> dist/assembly.png + .blend
-make setup          # one-time: create .venv, install Newton + JS deps
+make flatten        # ** reverse ** unfold a 3D panel mesh -> flat 2D pattern (see tools/)
+make segment        # ** reverse ** split a 3D garment mesh into panels by marked seams
+make setup          # one-time: create .venv, install Newton + tool deps
 ```
 
 Knobs are Make variables: `make drape-gl FRAMES=400 MAXAREA=70`, `make render SA=0`
