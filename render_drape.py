@@ -53,9 +53,10 @@ torso.name = "body"
 # ghost the mannequin: a faint reference so the coloured PATTERN pieces are what
 # you actually see (the loose sleeves sag off the thin arms, so opaque arms hide them)
 bodymat = mat("body", (0.80, 0.80, 0.82), 0.5)
+_alpha = float(os.environ.get("BODY_ALPHA") or 0.22)   # 1.0 = opaque (matches the GL viewer)
 bodymat.blend_method = "BLEND"
 bodymat.show_transparent_back = False
-bodymat.node_tree.nodes["Principled BSDF"].inputs["Alpha"].default_value = 0.22
+bodymat.node_tree.nodes["Principled BSDF"].inputs["Alpha"].default_value = _alpha
 torso.data.materials.append(bodymat)
 bpy.ops.object.shade_smooth()
 

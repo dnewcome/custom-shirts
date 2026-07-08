@@ -154,7 +154,9 @@ def avatar_body():
     V[:, 1] -= 0.5 * (V[:, 1].min() + V[:, 1].max())           # centre front/back
     if os.environ.get("AV_FLIP") == "1":
         V[:, 1] = -V[:, 1]                                     # face -y (our front)
-    V *= float(os.environ.get("AV_SCALE") or 1.08)   # fill the shirt a bit (less excess -> less pucker)
+    # the shirt is drafted for a men's frame; the Female avatar defaults smaller,
+    # so scale it up to match — otherwise the thin arms swim in the sleeves.
+    V *= float(os.environ.get("AV_SCALE") or 1.25)
     # find the shoulder height: topmost z where the torso (|x|<0.25) spreads past 0.16
     zt = V[:, 2].max(); sh_z = zt
     for z in np.linspace(zt, V[:, 2].min(), 80):
@@ -397,11 +399,25 @@ class Example:
             gb, pbl = [], []
             for be in targets:
                 gb += edge_globals(*be); pbl.append(edge_pos(*be))
-            pb = np.vstack(pbl); thr = THRESH.get(st.get("kind"), 0.015); hit = 0
-            for m, a in enumerate(ga):
-                d = np.linalg.norm(pb - pa[m], axis=1); j = int(np.argmin(d))
-                if d[j] < thr: union(a, gb[j]); hit += 1
-            print(f"    {st.get('kind','?'):9s} {st['a'][0]}.{st['a'][1]:12s} -> {hit}/{len(ga)} welds")
+            gb = list(gb); pb = np.vstack(pbl); thr = THRESH.get(st.get("kind"), 0.015)
+            # weld the SMALLER edge to UNIQUE nearest targets on the larger edge.
+            # never reuse a target -> no two verts collapse into one -> no dropped
+            # triangles -> no holes at a many-to-few seam (the armscye).
+            if len(ga) <= len(gb):
+                sg, sp, tg, tp = ga, pa, gb, pb
+            else:
+                sg, sp, tg, tp = gb, pb, ga, pa
+            used, hit = set(), 0
+            for m, s in enumerate(sg):
+                for j in np.argsort(np.linalg.norm(tp - sp[m], axis=1)):
+                    j = int(j)
+                    if j in used:
+                        continue
+                    if np.linalg.norm(tp[j] - sp[m]) >= thr:
+                        break
+                    union(s, tg[j]); used.add(j); hit += 1
+                    break
+            print(f"    {st.get('kind','?'):9s} {st['a'][0]}.{st['a'][1]:12s} -> {hit}/{len(sg)} welds")
         for a, b in collar_welds:        # weld each collar band onto its neckline (1:1, coincident)
             union(a, b)
         print(f"    collar    (row0->neckline)      -> {len(collar_welds)} welds")
