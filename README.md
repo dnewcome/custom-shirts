@@ -127,9 +127,13 @@ steps.
 - **Collider normals must face outward.** An inside-out torso mesh produces no
   contacts and the cloth free-falls through it. `torso_mesh()` flips faces to
   radial-outward.
-- **Seams must start coincident.** `add_spring` takes its rest length from the
-  vertices' current positions, so a sewing spring holds an already-closed seam —
-  it can't pull a gap shut. Place seam edges on top of each other.
+- **Weld seams; don't spring them.** SolverStyle3D does *not* integrate generic
+  `add_spring` springs (its only spring is the interactive drag tool), so sewing
+  by springs silently does nothing — seams drift open. A seam is *shared
+  topology*: merge the coincident seam vertices into one particle (union-find
+  over the stitch graph), pass the welded 3D `indices` while keeping each panel's
+  flat pattern as its own `panel_verts` / `panel_indices` UV island. Drop any
+  triangle the weld collapses (its BVH will assert otherwise).
 - **Don't compress a region to a point.** Collapsing the sleeve-cap interior to a
   single ring made both sleeves explode to −15 m. Spread verts with the loft.
 - **Damp hanging seams.** Newton's default spring damping is 0; an undamped,

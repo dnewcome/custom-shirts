@@ -107,7 +107,9 @@ const sEdges = segment(S.outline, [
 const garment = {
   units: 'mm',
   measurements,
-  fabric: { density: 0.30, tri_aniso_ke: [1e2, 1e2, 1e1], edge_aniso_ke: [2e-5, 1e-5, 5e-6] },
+  // heavier cotton/poly twill: more mass (hangs straighter) + much stiffer
+  // bending (fewer, larger folds — reads as thick, not papery).
+  fabric: { density: 0.48, tri_aniso_ke: [1.5e2, 1.5e2, 2e1], edge_aniso_ke: [3e-4, 1.6e-4, 8e-5] },
   templates: {
     front: { outline: F.outline, edges: fEdges },
     back: { outline: B.outline, edges: bEdges },

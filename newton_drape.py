@@ -220,31 +220,23 @@ class Example:
             xmax = float(np.asarray(t["outline"])[:, 0].max())
             tmpl[name] = dict(v2d=v2d, tris=tris, nbnd=nbnd, xmax=xmax, edges=t["edges"])
 
-        # instances: place + add cloth
-        inst = {}
-        def add_instance(name, spec, pos3d):
-            T = tmpl[spec["template"]]; off = builder.particle_count
-            style3d.add_cloth_mesh(
-                builder, pos=wp.vec3(0, 0, 0), rot=wp.quat_identity(), vel=wp.vec3(0, 0, 0),
-                vertices=[wp.vec3(*p) for p in pos3d],
-                indices=T["tris"].reshape(-1).tolist(),
-                panel_verts=[wp.vec2(*(p * MM)) for p in T["v2d"]],
-                panel_indices=T["tris"].reshape(-1).tolist(),
-                density=FAB["density"], scale=1.0, particle_radius=5.0e-3,
-                tri_aniso_ke=wp.vec3(*FAB["tri_aniso_ke"]),
-                edge_aniso_ke=wp.vec3(*FAB["edge_aniso_ke"]), label=name)
-            inst[name] = dict(off=off, pos3d=pos3d, tmpl=spec["template"])
-        # pass 1: body panels (wrap); pass 2: sleeves (need the armhole ring placed)
-        for name, spec in G["instances"].items():
+        # ---- place every instance into ONE un-merged vertex pool ----
+        inst = {}; V3 = []; PV = []; TRI = []; arms = []; voff = 0
+        def register(name, spec, pos3d):
+            nonlocal voff
+            T = tmpl[spec["template"]]
+            inst[name] = dict(off=voff, n=len(pos3d), tmpl=spec["template"], pos3d=pos3d)
+            V3.append(pos3d.astype(float)); PV.append(T["v2d"].astype(float) * MM)
+            TRI.append(T["tris"] + voff); voff += len(pos3d)
+        for name, spec in G["instances"].items():           # body first
             if spec["template"] == "sleeve": continue
             T = tmpl[spec["template"]]
-            add_instance(name, spec, push_out(wrap(T["v2d"], T["xmax"], spec["sx"], spec["fy"])))
-        arms = []
-        for name, spec in G["instances"].items():
+            register(name, spec, push_out(wrap(T["v2d"], T["xmax"], spec["sx"], spec["fy"])))
+        for name, spec in G["instances"].items():            # sleeves need the armhole ring
             if spec["template"] != "sleeve": continue
             pos3d, A0, D = place_sleeve(tmpl["sleeve"], spec["side"], inst, tmpl)
-            add_instance(name, spec, pos3d)
-            arms.append((A0, D))
+            register(name, spec, pos3d); arms.append((A0, D))
+        V3 = np.vstack(V3); PV = np.vstack(PV); TRI = np.vstack(TRI)
         self.tmpl, self.inst = tmpl, inst
 
         def edge_globals(instance, edge):
@@ -252,56 +244,84 @@ class Example:
         def edge_pos(instance, edge):
             i = inst[instance]; return i["pos3d"][tmpl[i["tmpl"]]["edges"][edge]]
 
-        # STITCH GRAPH: pair each declared edge (coincident) and spring it.
-        # `b` may be a single [inst,edge] or a list of them (e.g. cap <-> f+b armhole).
-        KE = 2.0e2
-        KD = 0.5                       # damping — undamped seams let hanging sleeves resonate off
-        THRESH = {"armscye": 0.060}    # cap lands near the ring nodes; attach generously
-        nsp = 0
+        # ---- STITCH GRAPH: WELD paired seam verts into shared particles ----
+        # SolverStyle3D does NOT integrate springs; a seam is shared topology
+        # (one particle used by both panels), with the flat pattern kept as
+        # separate UV islands (panel_verts). `b` may be a single edge or a list.
+        parent = list(range(voff))
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]; x = parent[x]
+            return x
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb: parent[ra] = rb
+        THRESH = {"armscye": 0.030}
         for st in G["stitches"]:
             ga = edge_globals(*st["a"]); pa = edge_pos(*st["a"])
-            b = st["b"]
-            targets = b if isinstance(b[0], list) else [b]
+            b = st["b"]; targets = b if isinstance(b[0], list) else [b]
             gb, pbl = [], []
             for be in targets:
                 gb += edge_globals(*be); pbl.append(edge_pos(*be))
-            pb = np.vstack(pbl)
-            thr = THRESH.get(st.get("kind"), 0.015)
-            hit = 0
+            pb = np.vstack(pbl); thr = THRESH.get(st.get("kind"), 0.015); hit = 0
             for m, a in enumerate(ga):
                 d = np.linalg.norm(pb - pa[m], axis=1); j = int(np.argmin(d))
-                if d[j] < thr:
-                    builder.add_spring(a, gb[j], KE, KD, control=0.0); nsp += 1; hit += 1
-            print(f"    {st.get('kind','?'):9s} {st['a'][0]}.{st['a'][1]:12s} -> {hit}/{len(ga)} springs")
-        print(f"[stitch] {nsp} springs over {len(G['stitches'])} graph seams (ke={KE:g})")
+                if d[j] < thr: union(a, gb[j]); hit += 1
+            print(f"    {st.get('kind','?'):9s} {st['a'][0]}.{st['a'][1]:12s} -> {hit}/{len(ga)} welds")
 
-        # torso collider
+        # collapse each union to one particle at the group's mean position
+        roots = np.array([find(i) for i in range(voff)])
+        uniq = np.unique(roots)
+        newidx = {int(r): k for k, r in enumerate(uniq)}
+        vmap = np.array([newidx[int(r)] for r in roots])       # old panel vert -> merged idx
+        Vm = np.zeros((len(uniq), 3)); cnt = np.zeros(len(uniq))
+        np.add.at(Vm, vmap, V3); np.add.at(cnt, vmap, 1.0)
+        Vm /= cnt[:, None]
+        indices3d = vmap[TRI.reshape(-1)].reshape(-1, 3)       # welded 3D topology
+        # welding can collapse a triangle (two of its verts merged) -> drop those
+        # from BOTH the 3D and the UV index arrays so they stay parallel
+        keep = ((indices3d[:, 0] != indices3d[:, 1]) &
+                (indices3d[:, 1] != indices3d[:, 2]) &
+                (indices3d[:, 0] != indices3d[:, 2]))
+        dropped = int((~keep).sum())
+        indices3d = indices3d[keep]; TRI = TRI[keep]
+        self.vmap = vmap
+        print(f"[weld] {voff} panel verts -> {len(uniq)} particles "
+              f"({voff - len(uniq)} welded, {dropped} collapsed tris dropped)")
+
+        # ONE Style3D cloth: welded 3D mesh + flat pattern as separate UV islands
+        style3d.add_cloth_mesh(
+            builder, pos=wp.vec3(0, 0, 0), rot=wp.quat_identity(), vel=wp.vec3(0, 0, 0),
+            vertices=[wp.vec3(*p) for p in Vm],
+            indices=indices3d.reshape(-1).tolist(),
+            panel_verts=[wp.vec2(*p) for p in PV],
+            panel_indices=TRI.reshape(-1).tolist(),
+            density=FAB["density"], scale=1.0, particle_radius=5.0e-3,
+            tri_aniso_ke=wp.vec3(*FAB["tri_aniso_ke"]),
+            edge_aniso_ke=wp.vec3(*FAB["edge_aniso_ke"]), label="shirt")
+
+        # torso + arm colliders
         tv, tf = torso_mesh()
         builder.add_shape_mesh(body=builder.add_body(),
                                xform=wp.transform(p=wp.vec3(0, 0, 0), q=wp.quat_identity()),
                                mesh=Mesh(tv.tolist(), tf.reshape(-1).tolist()))
-        # arm colliders: a capsule down each sleeve's axis so it drapes over an arm
         for A0, D in arms:
             center = A0 + D * 0.30
             builder.add_shape_capsule(body=builder.add_body(),
                                       xform=wp.transform(p=wp.vec3(*center), q=quat_z_to(D)),
                                       radius=0.050, half_height=0.22)
         self.model = builder.finalize()
+        self.gfaces = indices3d
 
-        # NECKBAND: pin the neckline edges (placed on the neck ring, above the
-        # collider) — the collar stand-in that stops the front from caping.
-        flags = self.model.particle_flags.numpy(); pinned = 0
+        # NECKBAND: pin the neckline edges (on the neck ring, above the collider)
+        flags = self.model.particle_flags.numpy(); pinned = set()
         for instance, edge in G["neckband"]["edges"]:
             for gi in edge_globals(instance, edge):
-                flags[gi] = flags[gi] & ~int(ParticleFlags.ACTIVE); pinned += 1
-        # pin the sleeve caps to the armhole ring (the armscye seam) — a stable
-        # anchor; the armscye springs then keep the shirt's armhole edge aligned.
-        for name, spec in G["instances"].items():
-            if spec["template"] == "sleeve":
-                for gi in edge_globals(name, "cap"):
-                    flags[gi] = flags[gi] & ~int(ParticleFlags.ACTIVE); pinned += 1
+                pinned.add(int(vmap[gi]))
+        for k in pinned:
+            flags[k] = flags[k] & ~int(ParticleFlags.ACTIVE)
         self.model.particle_flags = wp.array(flags)
-        print(f"[neckband] pinned {pinned} neckline particles to the neck ring")
+        print(f"[neckband] pinned {len(pinned)} neck particles")
 
         self.model.soft_contact_radius = 0.2e-2
         self.model.soft_contact_margin = 0.5e-2
@@ -320,8 +340,6 @@ class Example:
         except Exception:
             pass
 
-        gfaces = [tmpl[inst[n]["tmpl"]]["tris"] + inst[n]["off"] for n in inst]
-        self.gfaces = np.vstack(gfaces)
         self.torso = (tv, tf)
         print(f"[build] {builder.particle_count} particles, {len(self.gfaces)} garment tris")
         self.capture()
