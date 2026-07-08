@@ -85,15 +85,17 @@ neck-sized ring, and relaxes under gravity + collision. Requires an NVIDIA GPU
 
 > Status: a settled shirt draped on **Newton's Style3D "Female" avatar** (a real
 > human body, retargeted into our frame — `BODY=param` falls back to the
-> parametric torso+arms). The render **colour-codes each pattern piece**
-> (front / back / sleeve) over a ghosted body, so the drape reads as the *pattern*
-> — the colour boundaries are the seams (side, armscye, neckline). Caveat: the
-> avatar is **female and fixed-size**, so the fit shown is on her, not your
-> measurements. Refinements outstanding: collar "wings" where the neck funnel
-> meets the shoulder fold, sleeve length/coverage, avatar alignment
-> (`AV_SHOULDER` / `AV_SCALE` / `AV_FLIP`). **Cuffs and a collar band** are the
-> next spec additions. Tune live in `--viewer gl`: `FRAMES`, `MAXAREA`,
-> `ARM_DROP` (arm pose), `NECK_R`.
+> parametric torso+arms). Seams are resampled to matching attachment points and
+> weld 1:1, so the armscye/side/shoulder seams are clean. The render
+> **colour-codes each pattern piece** (front / back / sleeve) over a ghosted body
+> (`BODY_ALPHA=1.0` for an opaque body like the GL viewer). It reads as a real,
+> roomy shirt. Honest caveats: it's a **rough fit/construction preview**, not a
+> photoreal render — we assemble flat panels with heuristic placement on a
+> **scaled stand-in body**, so proportions are approximate and the definitive
+> fit test is a muslin. The procedural **collar is OFF by default** (`COLLAR=1`
+> to see it) — it reads as stiff cardboard; a real collar from the FreeSewing
+> collar/collarStand pattern is a future task. Tune live in `--viewer gl`:
+> `FRAMES`, `MAXAREA`, `ARM_DROP`, `AV_SCALE`.
 
 ### Adding a garment part
 

@@ -409,7 +409,9 @@ class Example:
             register(name, spec, pos3d); arms.append((A0, D))
         # ---- grow a folded collar band from each neckline edge (welds to it) ----
         collar_welds = []; self.collar_crease = []
-        for panel in ("frontR", "frontL", "backR", "backL"):
+        # collar OFF by default — the procedural band reads as stiff cardboard;
+        # COLLAR=1 re-enables it until a proper collar (from the real pattern) exists.
+        for panel in (("frontR", "frontL", "backR", "backL") if os.environ.get("COLLAR") == "1" else ()):
             nl_idx = tmpl[inst[panel]["tmpl"]]["edges"]["neckline"]
             cs = collar_strip(inst[panel]["pos3d"][nl_idx])
             if cs is None:
