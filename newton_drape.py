@@ -104,7 +104,7 @@ def torso_mesh():
 # ---------------------------------------------------------------- 3D placement
 A_P, B_P = _ab(M["chest"] + 90.0, 1.20, 0.80)      # garment wrap ellipse (chest + ease)
 NECK_R = G["neckband"]["circ"] / (2 * math.pi) * MM * 1.30   # neck opening radius
-NECK_Z = 0.085                                      # neck ring height (above collider)
+NECK_Z = 0.030                                      # neckline height — at the neck BASE (collar rises from here)
 NECK_BLEND = 180.0                                  # mm; funnel height below the ring
 
 def smoothstep(e0, e1, x):
@@ -134,7 +134,35 @@ SLEEVE_HW = 210.0   # sleeve bicep half-width, mm (|x| at y=0)
 SLEEVE_WW = 135.0   # sleeve wrist half-width, mm
 
 ARM_LEN = M["shoulderToWrist"] * MM   # 3D sleeve loft length = arm length, so it reaches the wrist
-ARM_DROP = float(os.environ.get("ARM_DROP") or 0.9)   # arm-axis downward tilt (bigger = more A-pose)
+BODY = os.environ.get("BODY", "avatar")               # "avatar" (Newton Female) or "param"
+# arm-axis downward tilt (bigger = more A-pose). The Female avatar's arms hang
+# ~62deg below horizontal, so the sleeves need a steeper drop to lie along them.
+ARM_DROP = float(os.environ.get("ARM_DROP") or (1.9 if BODY == "avatar" else 0.9))
+
+def avatar_body():
+    """Newton's Style3D 'Female' avatar as the body collider, retargeted into our
+    frame: Y-up -> Z-up, centred, shoulders aligned to the garment shoulder line.
+    Returns (verts m, tris). Tunable via AV_SHOULDER / AV_SCALE / AV_FLIP."""
+    from pxr import Usd
+    import newton.usd, newton.utils
+    ap = newton.utils.download_asset("style3d")
+    stage = Usd.Stage.Open(str(ap / "avatars" / "Female.usd"))   # keep alive: get_mesh reads via the prim
+    m = newton.usd.get_mesh(stage.GetPrimAtPath("/Root/Female/Root_SkinnedMesh_Avatar_0_Sub_2"))
+    V = np.asarray(m.vertices, float); F = np.asarray(m.indices, int).reshape(-1, 3)
+    V = np.column_stack([V[:, 0], -V[:, 2], V[:, 1]])          # Y-up -> Z-up
+    V[:, 0] -= 0.5 * (V[:, 0].min() + V[:, 0].max())           # centre L/R
+    V[:, 1] -= 0.5 * (V[:, 1].min() + V[:, 1].max())           # centre front/back
+    if os.environ.get("AV_FLIP") == "1":
+        V[:, 1] = -V[:, 1]                                     # face -y (our front)
+    V *= float(os.environ.get("AV_SCALE") or 1.08)   # fill the shirt a bit (less excess -> less pucker)
+    # find the shoulder height: topmost z where the torso (|x|<0.25) spreads past 0.16
+    zt = V[:, 2].max(); sh_z = zt
+    for z in np.linspace(zt, V[:, 2].min(), 80):
+        band = (np.abs(V[:, 2] - z) < 0.02) & (np.abs(V[:, 0]) < 0.25)
+        if band.any() and np.abs(V[band, 0]).max() > 0.16:
+            sh_z = z; break
+    V[:, 2] += float(os.environ.get("AV_SHOULDER") or 0.02) - sh_z
+    return V.astype(np.float32), F
 
 def arm_mesh(A0, D):
     """Tapered arm collider from the shoulder down the arm axis: upper-arm radius
@@ -241,6 +269,51 @@ def _damp_velocity(qd: wp.array(dtype=wp.vec3), k: float):
     i = wp.tid()
     qd[i] = qd[i] * k
 
+COLLAR_STAND = 0.026   # collar band stand height (up), m
+COLLAR_FALL_D = 0.052  # fold-over fall (down), m
+COLLAR_FALL_O = 0.030  # fold-over spread (out), m
+COLLAR_ROWS = 6        # rows across the band
+
+def collar_strip(P):
+    """Grow a folded collar band from a neckline edge. P = ordered neckline 3D
+    positions. The band rises from each neckline point (stand), creases, then
+    folds back down + out (the fall). Row 0 sits ON the neckline (welds to it).
+    Returns (verts3d, verts2d_mm, tris, inner_local, crease_local)."""
+    P = np.asarray(P, float); n = len(P)
+    if n < 2:
+        return None
+    ctr = P.mean(0)
+    rad = P - ctr; rad[:, 2] = 0.0
+    rad /= (np.linalg.norm(rad, axis=1, keepdims=True) + 1e-9)   # outward, horizontal
+    up = np.array([0.0, 0.0, 1.0])
+    seg = np.linalg.norm(np.diff(P, axis=0), axis=1)
+    u = np.concatenate([[0.0], np.cumsum(seg)])                  # arc-length along neckline (m)
+    crease_w = 0.42
+    prof, fw, pz, pr = [], 0.0, 0.0, 0.0                          # (dz, dr, flat-w)
+    for r in range(COLLAR_ROWS):
+        w = r / (COLLAR_ROWS - 1)
+        if w <= crease_w:
+            t = w / crease_w; dz, dr = COLLAR_STAND * t, 0.0
+        else:
+            s = (w - crease_w) / (1 - crease_w)
+            dz, dr = COLLAR_STAND - COLLAR_FALL_D * s, COLLAR_FALL_O * s
+        fw += math.hypot(dz - pz, dr - pr); pz, pr = dz, dr
+        prof.append((dz, dr, fw))
+    rows3, rows2 = [], []
+    for dz, dr, fw in prof:
+        rows3.append(P + up * dz + rad * dr)
+        rows2.append(np.column_stack([u, np.full(n, fw)]))
+    V3 = np.vstack(rows3); V2mm = np.vstack(rows2) / MM
+    tris = []
+    for r in range(COLLAR_ROWS - 1):
+        for i in range(n - 1):
+            a, b = r * n + i, r * n + i + 1
+            c, d = (r + 1) * n + i, (r + 1) * n + i + 1
+            tris += [[a, b, c], [b, d, c]]
+    crease_r = int(round(crease_w * (COLLAR_ROWS - 1)))
+    return (V3.astype(np.float32), V2mm, np.asarray(tris, int),
+            np.arange(n), np.arange(n) + crease_r * n)
+
 # ================================================================ Example
 class Example:
     def __init__(self, viewer, args):
@@ -263,7 +336,7 @@ class Example:
             tmpl[name] = dict(v2d=v2d, tris=tris, nbnd=nbnd, xmax=xmax, edges=t["edges"])
 
         # ---- place every instance into ONE un-merged vertex pool ----
-        TYPES = ["front", "back", "sleeve"]     # per-piece colour groups for the render
+        TYPES = ["front", "back", "sleeve", "collar"]   # per-piece colour groups for the render
         inst = {}; V3 = []; PV = []; TRI = []; TRITYPE = []; arms = []; voff = 0
         def register(name, spec, pos3d):
             nonlocal voff
@@ -281,6 +354,21 @@ class Example:
             if spec["template"] != "sleeve": continue
             pos3d, A0, D = place_sleeve(tmpl["sleeve"], spec["side"], inst, tmpl)
             register(name, spec, pos3d); arms.append((A0, D))
+        # ---- grow a folded collar band from each neckline edge (welds to it) ----
+        collar_welds = []; self.collar_crease = []
+        for panel in ("frontR", "frontL", "backR", "backL"):
+            nl_idx = tmpl[inst[panel]["tmpl"]]["edges"]["neckline"]
+            cs = collar_strip(inst[panel]["pos3d"][nl_idx])
+            if cs is None:
+                continue
+            V3c, V2c, tc, inner, crease = cs
+            off = voff
+            V3.append(V3c.astype(float)); PV.append(V2c * MM); TRI.append(tc + off)
+            TRITYPE.append(np.full(len(tc), TYPES.index("collar")))
+            voff += len(V3c)
+            for i in range(len(inner)):
+                collar_welds.append((off + int(inner[i]), inst[panel]["off"] + nl_idx[i]))
+            self.collar_crease.extend((off + crease).tolist())
         V3 = np.vstack(V3); PV = np.vstack(PV); TRI = np.vstack(TRI)
         TRITYPE = np.concatenate(TRITYPE)
         self.tmpl, self.inst, self.TYPES = tmpl, inst, TYPES
@@ -314,15 +402,23 @@ class Example:
                 d = np.linalg.norm(pb - pa[m], axis=1); j = int(np.argmin(d))
                 if d[j] < thr: union(a, gb[j]); hit += 1
             print(f"    {st.get('kind','?'):9s} {st['a'][0]}.{st['a'][1]:12s} -> {hit}/{len(ga)} welds")
+        for a, b in collar_welds:        # weld each collar band onto its neckline (1:1, coincident)
+            union(a, b)
+        print(f"    collar    (row0->neckline)      -> {len(collar_welds)} welds")
 
-        # collapse each union to one particle at the group's mean position
+        # collapse each union to one particle. Use the LOWEST-index member's
+        # position (not the mean) so a seam snaps onto the anchor panel's curve
+        # instead of drifting to a kinked midline — body registers before sleeves,
+        # so the cap snaps onto the armhole, backs onto fronts, etc.
         roots = np.array([find(i) for i in range(voff)])
         uniq = np.unique(roots)
         newidx = {int(r): k for k, r in enumerate(uniq)}
         vmap = np.array([newidx[int(r)] for r in roots])       # old panel vert -> merged idx
-        Vm = np.zeros((len(uniq), 3)); cnt = np.zeros(len(uniq))
-        np.add.at(Vm, vmap, V3); np.add.at(cnt, vmap, 1.0)
-        Vm /= cnt[:, None]
+        Vm = np.full((len(uniq), 3), np.nan)
+        for i in range(voff):
+            k = vmap[i]
+            if np.isnan(Vm[k, 0]):
+                Vm[k] = V3[i]                                    # first (lowest-index) member wins
         indices3d = vmap[TRI.reshape(-1)].reshape(-1, 3)       # welded 3D topology
         # welding can collapse a triangle (two of its verts merged) -> drop those
         # from BOTH the 3D and the UV index arrays so they stay parallel
@@ -349,18 +445,22 @@ class Example:
         # body collider: parametric torso + a tapered arm mesh per sleeve (sized
         # from measurements). Kept as separate shapes; combined for the render.
         ident = wp.transform(p=wp.vec3(0, 0, 0), q=wp.quat_identity())
-        tv, tf = torso_mesh()
-        builder.add_shape_mesh(body=builder.add_body(), xform=ident,
-                               mesh=Mesh(tv.tolist(), tf.reshape(-1).tolist()))
-        for A0, D in arms:
-            av, af = arm_mesh(A0, D)
+        if BODY == "avatar":
+            bv, bf = avatar_body()
             builder.add_shape_mesh(body=builder.add_body(), xform=ident,
-                                   mesh=Mesh(av.tolist(), af.reshape(-1).tolist()))
+                                   mesh=Mesh(bv.tolist(), bf.reshape(-1).tolist()))
+            self.body = (bv, bf)
+        else:
+            tv, tf = torso_mesh()
+            builder.add_shape_mesh(body=builder.add_body(), xform=ident,
+                                   mesh=Mesh(tv.tolist(), tf.reshape(-1).tolist()))
+            for A0, D in arms:                       # tapered arm colliders (param body only)
+                av, af = arm_mesh(A0, D)
+                builder.add_shape_mesh(body=builder.add_body(), xform=ident,
+                                       mesh=Mesh(av.tolist(), af.reshape(-1).tolist()))
+            self.body = (tv, tf)
         self.model = builder.finalize()
         self.gfaces = indices3d
-        # render only the torso; arms stay collider-only so they don't hide the
-        # (loose) amber sleeves that drape over them
-        self.body = (tv, tf)
 
         # NECKBAND: pin the neckline edges (on the neck ring, above the collider)
         flags = self.model.particle_flags.numpy(); pinned = set()
@@ -461,8 +561,8 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
-    parser.add_argument("--maxarea", type=float, default=110.0,
-                        help="triangle max area (mm^2); smaller = denser cloth")
+    parser.add_argument("--maxarea", type=float, default=75.0,
+                        help="triangle max area (mm^2); smaller = denser/smoother cloth")
     viewer, args = newton.examples.init(parser)
     example = Example(viewer, args)
     newton.examples.run(example, args)

@@ -81,15 +81,17 @@ parametric torso, stitches **exactly** the graph edges, holds the neckline to a
 neck-sized ring, and relaxes under gravity + collision. Requires an NVIDIA GPU
 (CUDA 12, driver 545+) and the `.venv` from `make setup`.
 
-> Status: a settled shirt **with sleeves on a parametric body + arms** (sized
-> from your measurements). The render **colour-codes each pattern piece**
+> Status: a settled shirt draped on **Newton's Style3D "Female" avatar** (a real
+> human body, retargeted into our frame — `BODY=param` falls back to the
+> parametric torso+arms). The render **colour-codes each pattern piece**
 > (front / back / sleeve) over a ghosted body, so the drape reads as the *pattern*
-> — the colour boundaries are the seams (side, armscye, neckline). Refinements
-> outstanding: crumpling where the neck funnel meets the shoulder fold, a slightly
-> generous fit, minor armhole gaps. **Cuffs and a collar band** are the next spec
-> additions (just a template + stitch rows). Tune live in `--viewer gl`:
-> `FRAMES`, `MAXAREA`, `ARM_DROP` (arm pose), and the `NECK_R`/ease constants in
-> `newton_drape.py`.
+> — the colour boundaries are the seams (side, armscye, neckline). Caveat: the
+> avatar is **female and fixed-size**, so the fit shown is on her, not your
+> measurements. Refinements outstanding: collar "wings" where the neck funnel
+> meets the shoulder fold, sleeve length/coverage, avatar alignment
+> (`AV_SHOULDER` / `AV_SCALE` / `AV_FLIP`). **Cuffs and a collar band** are the
+> next spec additions. Tune live in `--viewer gl`: `FRAMES`, `MAXAREA`,
+> `ARM_DROP` (arm pose), `NECK_R`.
 
 ### Adding a garment part
 

@@ -31,6 +31,7 @@ PIECE_COLOR = {
     "front":  (0.42, 0.50, 0.26),   # olive green
     "back":   (0.20, 0.34, 0.52),   # blue
     "sleeve": (0.85, 0.28, 0.02),   # vivid orange (unmistakably not skin)
+    "collar": (0.55, 0.22, 0.55),   # purple
 }
 for name, rgb in PIECE_COLOR.items():
     path = os.path.join(NEW, f"shirt_{name}.obj")
